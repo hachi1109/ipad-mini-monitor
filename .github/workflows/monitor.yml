@@ -3,7 +3,15 @@ name: iPad mini refurbished monitor
 on:
   schedule:
     - cron: "*/5 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "once = 通常の確認 / test = テスト通知だけ送る"
+        type: choice
+        default: once
+        options:
+          - once
+          - test
 
 concurrency:
   group: ipad-monitor
@@ -33,12 +41,13 @@ jobs:
       - name: Check store
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-
-
-          run: python monitor.py --test
+          MODE: ${{ github.event.inputs.mode || 'once' }}
+        run: python monitor.py --$MODE
 
       - name: Save state
         if: always()
