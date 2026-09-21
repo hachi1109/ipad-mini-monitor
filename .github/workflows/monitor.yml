@@ -38,8 +38,7 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
 
 
-          
-        run: python monitor.py --once
+          run: python monitor.py --test
 
       - name: Save state
         if: always()
