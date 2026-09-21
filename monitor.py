@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apple 日本 整備済製品(iPad)ストアの「iPad mini (A17 Pro)」在庫監視 → Discord通知
+"""Apple 日本 整備済製品(iPad)ストアの「iPad mini (A17 Pro)」在庫監視 → Discord / LINE / メール通知
 
 使い方:
   python3 monitor.py            # 3分おきに常時監視(Mac向け)
@@ -7,8 +7,13 @@
   python3 monitor.py --test     # Discordにテスト通知を送って終了
   python3 monitor.py --dry-run  # 通知せず、検出結果だけ表示(動作確認用)
 
-環境変数:
-  DISCORD_WEBHOOK_URL  (必須, --dry-run 以外)
+通知先(設定したものすべてに送ります。1つ以上が必須, --dry-run 以外):
+  Discord : DISCORD_WEBHOOK_URL
+  LINE    : LINE_CHANNEL_ACCESS_TOKEN と LINE_USER_ID  (Messaging API)
+  メール  : EMAIL_USER (Gmailアドレス) と EMAIL_APP_PASSWORD (アプリパスワード)
+            EMAIL_TO (任意。省略時は EMAIL_USER 宛)
+
+その他の環境変数:
   INTERVAL_SECONDS     (任意, 既定 180)
   STATE_FILE           (任意, 既定 seen.json  通知済み商品の記録)
 """
@@ -20,8 +25,11 @@ import os
 import re
 import sys
 import time
+import smtplib
+import ssl
 import unicodedata
 from datetime import datetime
+from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -100,12 +108,79 @@ def save_seen(seen: set[str]) -> None:
     STATE_FILE.write_text(json.dumps(sorted(seen), ensure_ascii=False), encoding="utf-8")
 
 
-def send_discord(content: str) -> None:
-    url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not url:
-        raise RuntimeError("環境変数 DISCORD_WEBHOOK_URL が設定されていません")
-    r = requests.post(url, json={"content": content}, timeout=15)
+def _env(name: str) -> str:
+    """未設定・空文字・前後の空白/改行を吸収して返す"""
+    return (os.environ.get(name) or "").strip()
+
+
+def send_discord(subject: str, body: str) -> None:
+    r = requests.post(
+        _env("DISCORD_WEBHOOK_URL"),
+        json={"content": f"{subject}\n{body}"},
+        timeout=15,
+    )
     r.raise_for_status()
+
+
+def send_line(subject: str, body: str) -> None:
+    r = requests.post(
+        "https://api.line.me/v2/bot/message/push",
+        headers={"Authorization": f"Bearer {_env('LINE_CHANNEL_ACCESS_TOKEN')}"},
+        json={
+            "to": _env("LINE_USER_ID"),
+            "messages": [{"type": "text", "text": f"{subject}\n{body}"[:4900]}],
+        },
+        timeout=15,
+    )
+    if not r.ok:
+        raise RuntimeError(f"LINE API エラー {r.status_code}: {r.text[:200]}")
+
+
+def send_email(subject: str, body: str) -> None:
+    user = _env("EMAIL_USER")
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = user
+    msg["To"] = _env("EMAIL_TO") or user
+    msg.set_content(body)
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=30
+    ) as s:
+        s.login(user, _env("EMAIL_APP_PASSWORD").replace(" ", ""))
+        s.send_message(msg)
+
+
+def configured_channels() -> list[tuple[str, callable]]:
+    """環境変数が揃っている通知先だけを返す"""
+    ch: list[tuple[str, callable]] = []
+    if _env("DISCORD_WEBHOOK_URL"):
+        ch.append(("Discord", send_discord))
+    if _env("LINE_CHANNEL_ACCESS_TOKEN") and _env("LINE_USER_ID"):
+        ch.append(("LINE", send_line))
+    if _env("EMAIL_USER") and _env("EMAIL_APP_PASSWORD"):
+        ch.append(("メール", send_email))
+    return ch
+
+
+def notify(subject: str, body: str) -> None:
+    """設定済みの全通知先に送る。1つでも成功すれば成功扱い(全滅なら例外)"""
+    channels = configured_channels()
+    if not channels:
+        raise RuntimeError(
+            "通知先が未設定です(DISCORD_WEBHOOK_URL / LINE_* / EMAIL_* のいずれかを設定してください)"
+        )
+    ok = 0
+    errors: list[str] = []
+    for name, fn in channels:
+        try:
+            fn(subject, body)
+            ok += 1
+            log(f"  {name} に送信しました")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{name}: {e}")
+            log(f"  {name} への送信に失敗: {e}")
+    if ok == 0:
+        raise RuntimeError("すべての通知先への送信に失敗しました → " + " / ".join(errors))
 
 
 def check_once(dry_run: bool = False) -> None:
@@ -119,19 +194,27 @@ def check_once(dry_run: bool = False) -> None:
     log(f"商品 {len(products)} 件を確認 / 該当 {len(hits)} 件")
 
     seen = load_seen()
-    current_ids = {p["id"] for p in hits}
+    keep = {p["id"] for p in hits if p["id"] in seen}  # 掲載継続中の通知済み商品
+    failure: Exception | None = None
     for p in hits:
         if p["id"] in seen:
             continue
-        msg = f"🍎 整備済製品に入荷しました!\n**{p['name']}**\n{p['url']}"
+        subject = "【整備済製品】iPad mini (A17 Pro) が入荷しました"
+        body = f"{p['name']}\n{p['url']}"
         if dry_run:
-            log("[dry-run] 通知内容:\n" + msg)
-        else:
-            send_discord(msg)
+            log(f"[dry-run] 通知内容:\n{subject}\n{body}")
+            continue
+        try:
+            notify(subject, body)
+            keep.add(p["id"])
             log(f"通知しました: {p['name']}")
+        except Exception as e:  # noqa: BLE001
+            failure = e  # 通知に失敗した商品は記録せず、次回もう一度通知を試みる
     if not dry_run:
-        # 現在掲載中のものだけ記録(売り切れて後日再掲載されたら、再度通知される)
-        save_seen(current_ids)
+        # 現在掲載中の通知済みのものだけ記録(売り切れて後日再掲載されたら、再度通知される)
+        save_seen(keep)
+    if failure:
+        raise failure
 
 
 def main() -> int:
@@ -142,9 +225,12 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.test:
-        send_discord("✅ テスト通知: iPad mini 整備済製品モニターは正常に動作しています。")
-        log("テスト通知を送信しました")
-        return 0
+        try:
+            notify("【テスト】iPad mini 整備済製品モニター", "この通知が届けば、設定は正常です。")
+            return 0
+        except Exception as e:  # noqa: BLE001
+            log(f"エラー: {e}")
+            return 1
 
     if args.dry_run or args.once:
         try:
@@ -166,7 +252,7 @@ def main() -> int:
             log(f"エラー({fails}回連続): {e}")
             if fails >= FAIL_ALERT_THRESHOLD and not alerted:
                 try:
-                    send_discord(f"⚠️ 監視が{fails}回連続で失敗しています: {e}")
+                    notify("【警告】iPad mini モニター", f"監視が{fails}回連続で失敗しています: {e}")
                     alerted = True
                 except Exception as e2:  # noqa: BLE001
                     log(f"警告通知にも失敗: {e2}")
