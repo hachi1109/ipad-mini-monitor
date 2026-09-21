@@ -1,0 +1,57 @@
+name: Apple Watch Series 11 refurbished monitor
+
+on:
+  schedule:
+    - cron: "0-59/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "once = 通常の確認 / test = テスト通知だけ送る"
+        type: choice
+        default: once
+        options:
+          - once
+          - test
+
+concurrency:
+  group: watch-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: watch_seen.json
+          key: watch-seen-${{ github.run_id }}
+          restore-keys: watch-seen-
+
+      - name: Check store
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          MODE: ${{ github.event.inputs.mode || 'once' }}
+        run: python watch_monitor.py --$MODE
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: watch_seen.json
+          key: watch-seen-${{ github.run_id }}
